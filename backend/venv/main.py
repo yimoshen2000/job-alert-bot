@@ -1,54 +1,100 @@
-from flask import Flask, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
+import csv 
+import pickle
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+import uuid
 
-app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///job_alerts.db'
-db = SQLAlchemy(app)
+# Load or initialize job_ids_dict from file
+try:
+        with open('job_ids_dict.pkl', 'rb') as f:
+                job_ids_dict = pickle.load(f)
+except FileNotFoundError:
+        job_ids_dict = {}
 
-class JobAlert(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(100))
-    company = db.Column(db.String(100))
-    url = db.Column(db.String(200))
-    duration = db.Column(db.Integer)
+driver = webdriver.Chrome()
 
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'title': self.title,
-            'company': self.company,
-            'url': self.url,
-            'duration': self.duration
-        }
+wait = WebDriverWait(driver, 10)
 
-@app.route('/job_alerts', methods=['GET'])
-def get_job_alerts():
-    job_alerts = JobAlert.query.filter(JobAlert.duration > 0).all()
-    return jsonify([alert.to_dict() for alert in job_alerts])
+company_urls = [
+    'https://mastercard.wd1.myworkdayjobs.com/en-US/CorporateCareers',
+    # 'https://intel.wd1.myworkdayjobs.com/en-US/External',
+    # 'https://trimble.wd1.myworkdayjobs.com/en-US/TrimbleCareers/',
+    'https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite',
+    # 'https://cvshealth.wd1.myworkdayjobs.com/CVS_Health_Careers',
+    # 'https://motorolasolutions.wd5.myworkdayjobs.com/en-US/Careers/',
+    # 'https://bah.wd1.myworkdayjobs.com/en-US/BAH_Jobs', 
+]  # Add your company URLs here
 
-@app.route('/job_alerts', methods=['POST'])
-def create_job_alert():
-    data = request.get_json()
-    title = data.get('title')
-    company = data.get('company')
-    url = data.get('url')
-    duration = data.get('duration')
+for company_url in company_urls:
+    if company_url not in job_ids_dict:
+        job_ids_dict[company_url] = []
 
-    job_alert = JobAlert(title=title, company=company, url=url, duration=duration)
-    db.session.add(job_alert)
-    db.session.commit()
+while True:
+    jobs = []
+    for company_url in company_urls:
+        jobstosend = []
+        driver.get(company_url)
+        seturl = company_url
+        try:
+            today = True
+            while today:
+                time.sleep(2)
+                wait.until(EC.presence_of_element_located((By.XPATH, '//li[@class="css-1q2dra3"]')))
+                
+                job_elements = driver.find_elements(By.XPATH, '//li[@class="css-1q2dra3"]')
 
-    return jsonify(job_alert.to_dict()), 201
+                for job_element in job_elements:
+                    job_title_element = job_element.find_element(By.XPATH, './/h3/a')
+                    job_id_element = job_element.find_element(By.XPATH, './/ul[@data-automation-id="subtitle"]/li')
+                    job_id = job_id_element.text
+                    posted_on_element = job_element.find_element(By.XPATH, './/dd[@class="css-129m7dg"][preceding-sibling::dt[contains(text(),"posted on")]]')
+                    posted_on = posted_on_element.text
+                    if 'posted today' in posted_on.lower():
+                        job_href = job_title_element.get_attribute('href')
+                        job_title = job_title_element.text
+                        if job_id not in job_ids_dict[company_url]:
+                            job_ids_dict[company_url].append(job_id)
+                            jobstosend.append((job_title, job_href))
+                        else:
+                            print(f"Job ID {job_id} already in job_ids_dict")
+                    else:
+                        today = False
 
-@app.route('/job_alerts/<int:alert_id>', methods=['DELETE'])
-def delete_job_alert(alert_id):
-    job_alert = JobAlert.query.get(alert_id)
-    if job_alert:
-        db.session.delete(job_alert)
-        db.session.commit()
-        return '', 204
-    else:
-        return jsonify({'error': 'Job alert not found'}), 404
+                next_button = driver.find_element(By.XPATH, '//button[@data-uxi-element-id="next"]')
+                if "disabled" in next_button.get_attribute("class"):
+                    break  # exit loop if the "next" button is disabled
+                
+                next_button.click()
+        except Exception as e:
+            print(f"An error occurred while processing {company_url}: {str(e)}")
+            continue
 
-if __name__ == '__main__':
-    app.run(debug=True)
+        print(len(job_ids_dict[company_urls[0]]))
+        print(len(jobstosend))
+
+        for job_title, job_href in jobstosend:
+            driver.get(job_href)
+            time.sleep(1)
+            job_posting_element = wait.until(EC.presence_of_element_located((By.XPATH, '//div[@data-automation-id="job-posting-details"]')))
+            job_posting_text = job_posting_element.text
+            redis_id = str(uuid.uuid4())
+            job_info = {'company_url': seturl,'job_title': job_title, 'job_href': job_href, 'job_posting_text': job_posting_text}
+            jobs.append((seturl, job_title, job_href, job_posting_text))
+
+
+    # Write job postings to a CSV file
+    with open('job_postings.csv', 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['companyurl','Job Title', 'Job Href', 'Job Posting'])
+        for job in jobs:
+            writer.writerow(job)
+
+    # Save job_ids_dict to file
+        with open('job_ids_dict.pkl', 'wb') as f:
+            pickle.dump(job_ids_dict, f)
+
+    # Wait for a certain period before running again
+    time.sleep(600)  # Run every hour
